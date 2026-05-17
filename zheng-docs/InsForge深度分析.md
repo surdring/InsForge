@@ -120,7 +120,7 @@ InsForge 采用 **双层数据访问架构**：
 ```
 Client SDK (select/insert/update/delete)
   → InsForge Backend (PostgrestProxyService)
-    → PostgREST (port 3001)
+    → PostgREST (port 3000)
       → PostgreSQL
 
 Dashboard Admin (table management, raw SQL)

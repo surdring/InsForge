@@ -208,6 +208,47 @@ curl http://localhost:7130/api/health
 }
 ```
 
+#### 容器端口架构说明
+
+Docker Compose 中每个服务的端口映射关系：
+
+```
+宿主机                         Docker 内部网络
+───────                       ──────────────
+                              ┌─────────────────┐
+                              │   PostgreSQL     │
+                              │   监听 :5432      │
+                              └────────┬────────┘
+                                       │
+                              ┌────────┴────────┐
+                              │   PostgREST      │
+                              │   监听 :3000      │◄── 内部端口，仅容器间通信
+                              └────────┬────────┘
+                                       │  http://postgrest:3000
+                              ┌────────┴────────┐
+:7130 ◄──────────────────────►│   InsForge       │
+:7131 ◄──────────────────────►│   监听 :7130      │◄── 外部唯一入口
+                              └────────┬────────┘
+                                       │
+                              ┌────────┴────────┐
+:7133 ◄──────────────────────►│   Deno           │
+                              │   监听 :7133      │
+                              └─────────────────┘
+```
+
+| 容器 | 内部端口 | 宿主机映射 | 用途 |
+|------|---------|-----------|------|
+| PostgreSQL | 5432 | `${POSTGRES_PORT:-5432}` | 数据库服务，仅容器间通信 |
+| PostgREST | 3000 | `${POSTGREST_PORT:-5430}` | REST API 网关，**仅 InsForge 后端通过 `http://postgrest:3000` 调用** |
+| InsForge | 7130 | `${APP_PORT:-7130}` | **外部唯一入口**，Dashboard + API |
+| Deno | 7133 | `${DENO_PORT:-7133}` | 边缘函数运行时 |
+
+> **关键理解**：PostgREST 的内部端口 3000 仅供 InsForge 后端在 Docker 内部网络中调用。外部请求的数据流是：
+> ```
+> 客户端 → InsForge(:7130) → PostgREST(postgrest:3000) → PostgreSQL(:5432)
+> ```
+> PostgREST 本身没有认证层，认证由 InsForge 后端注入 JWT。生产环境不应将 PostgREST 端口（5430）对外暴露，所有请求应统一经过 InsForge 后端。
+
 ### 2B.5 访问 Dashboard 并获取 ANON_KEY
 
 1. 打开浏览器访问 `http://localhost:7130`
@@ -233,24 +274,24 @@ const insforge = createClient({
 
 ### 2B.7 自托管 MCP 配置
 
-自托管模式下，MCP 服务器配置与 Cloud 模式相同，但需要确保 MCP 工具能访问本地 InsForge 实例。
-
-在 AI 编码助手中配置 MCP 时，使用本地地址：
+自托管模式下，使用 `npx @insforge/install` 命令一键配置 MCP，或手动在 AI 编码工具的 MCP 配置中添加：
 
 ```json
 {
   "mcpServers": {
     "insforge": {
       "command": "npx",
-      "args": ["-y", "@insforge/mcp-server"],
+      "args": ["-y", "@insforge/mcp@latest"],
       "env": {
-        "INSFORGE_BASE_URL": "http://localhost:7130",
-        "INSFORGE_ANON_KEY": "your-anon-key-from-dashboard"
+        "API_KEY": "your-api-key-here",
+        "API_BASE_URL": "http://localhost:7130"
       }
     }
   }
 }
 ```
+
+> **提示**：API Key 以 `ik_` 为前缀，可从 Dashboard Settings → API 页面获取。MCP 配置的实际路径因工具而异（如 Trae 为 `~/.config/Trae/User/mcp.json`）。
 
 ### 2B.8 自托管与 Cloud 模式的关键差异
 
@@ -259,7 +300,7 @@ const insforge = createClient({
 | **baseUrl** | `https://your-app.region.insforge.app` | `http://localhost:7130`（或服务器 IP） |
 | **ANON_KEY 获取** | CLI `get-backend-metadata` 自动获取 | Dashboard Settings → API 手动复制 |
 | **Edge Functions** | 云端 Deno Subhosting 自动部署 | 本地 Deno 容器（端口 7133），需挂载函数目录 |
-| **数据库直连** | 不可直连 PostgREST | 可直连 `localhost:5430`（但不推荐，应通过 SDK） |
+| **数据库直连** | 不可直连 PostgreSQL | 可直连 `localhost:${POSTGRES_PORT}`（默认 5432），也可通过 PostgREST `localhost:${POSTGREST_PORT}`（默认 5430）访问 REST API |
 | **存储** | 云端 S3 兼容存储 | 本地卷存储（`storage-data`），也可配置外部 S3 |
 | **AI 模型** | 通过 OpenRouter 网关 | 需自行配置 `OPENROUTER_API_KEY` |
 | **OAuth** | Dashboard 配置 | `.env` 文件中配置 |
@@ -287,7 +328,7 @@ docker compose --env-file .env.project2 -p project2 up -d
 ### 2B.10 自托管生产环境建议
 
 1. **使用反向代理**：通过 Nginx 或 Caddy 配置 HTTPS
-2. **配置防火墙**：仅暴露 80/443 端口，内部端口（5432、5430、7131、7133）不对外
+2. **配置防火墙**：仅暴露 7130 端口（或通过反向代理暴露 80/443），内部端口（5432、5430、7133）不对外
 3. **定期备份**：备份 PostgreSQL 数据卷和 `storage-data` 卷
 4. **监控日志**：`docker compose logs -f` 查看实时日志
 5. **锁定版本**：在 `docker-compose.yml` 中指定镜像版本号，避免意外升级
@@ -304,17 +345,23 @@ InsForge 提供 MCP（Model Context Protocol）服务器，让 AI 编码代理�
 
 ### 3.2 自托管模式 MCP 配置
 
-自托管模式下，需要手动配置 MCP 服务器地址。在 AI 编码工具的 MCP 配置中添加：
+自托管模式下，使用安装命令一键配置：
+
+```bash
+npx @insforge/install --client <your-ai-tool> --env API_KEY=<your-api-key> --env API_BASE_URL=http://localhost:7130
+```
+
+或手动在 AI 编码工具的 MCP 配置中添加：
 
 ```json
 {
   "mcpServers": {
     "insforge": {
       "command": "npx",
-      "args": ["-y", "@insforge/mcp-server"],
+      "args": ["-y", "@insforge/mcp@latest"],
       "env": {
-        "INSFORGE_BASE_URL": "http://localhost:7130",
-        "INSFORGE_ANON_KEY": "your-anon-key-from-dashboard"
+        "API_KEY": "your-api-key-here",
+        "API_BASE_URL": "http://localhost:7130"
       }
     }
   }
@@ -1539,11 +1586,11 @@ docker compose up -d
 ```
 
 **容器架构**：
-| 容器 | 端口 | 说明 |
-|------|------|------|
+| 容器 | 内部端口 | 说明 |
+|------|---------|------|
 | PostgreSQL | 5432 | 数据库服务（含 pg_cron、pg_net、pgjwt 等扩展） |
-| PostgREST | 3001 | 自动 REST API（v12） |
-| InsForge | 3000 | 主后端服务（Express.js） |
+| PostgREST | 3000 | 自动 REST API（v12） |
+| InsForge | 7130 | 主后端服务（Express.js） |
 | Deno | 7133 | 边缘函数运行时 |
 
 **关键环境变量**：
